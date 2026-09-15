@@ -36,6 +36,13 @@ func runGit(dir string, token string, args ...string) (string, error) {
 
 	cmd := exec.CommandContext(ctx, "git", args...)
 	cmd.Dir = dir
+	// Bound how long Wait() can block after the process is killed. Without
+	// this, a hung grandchild (e.g. git-remote-https or ssh, left behind if
+	// the VPS stalls under CPU/IO pressure) can keep stdout/stderr pipes open
+	// forever, and CombinedOutput would never return even though git itself
+	// was already killed by the context timeout — wedging this goroutine,
+	// and with it the whole watch loop, permanently.
+	cmd.WaitDelay = 5 * time.Second
 
 	env := os.Environ()
 	var cleanup func()

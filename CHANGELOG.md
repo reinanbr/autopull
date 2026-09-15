@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v1.2.10] - 2026-09-15
+
+### Fixed
+- Fixed a hang that could permanently wedge the watch loop: `exec.CommandContext`'s 15s timeout kills the `git` process itself, but if `git` had spawned a subprocess (e.g. `git-remote-https`, `ssh`) that inherited the stdout/stderr pipes and was left running — plausible under host-level CPU steal / IO stalls — `cmd.Wait()` could block forever waiting for those pipes to close, even though `git` was already dead. One repo's watcher would then go silent indefinitely (no more log lines, no crash, no systemd restart, since the process never actually exited) until manually restarted. `cmd.WaitDelay` is now set on every git invocation so `Wait()` is bounded to `gitTimeout + 5s` regardless of orphaned children.
+
 ## [v1.2.9] - 2026-09-15
 
 ### Fixed
