@@ -277,13 +277,33 @@ func TestCmdService_UnknownAction(t *testing.T) {
 	}
 }
 
-func TestCmdService_LogsInvalidLineCount(t *testing.T) {
+func TestCmdService_LogsNonNumericArgTreatedAsConfigPath(t *testing.T) {
 	if runtime.GOOS != "linux" {
 		t.Skip("service command is linux-only")
 	}
+	// A non-numeric arg to "logs" now selects which repo's service to tail
+	// (each repo gets its own systemd unit), not an invalid line count.
 	err := autopull.CmdService([]string{"logs", "notanumber"})
-	if err == nil || !strings.Contains(err.Error(), "numeric") {
-		t.Fatalf("expected numeric error, got %v", err)
+	if err != nil && strings.Contains(err.Error(), "numeric") {
+		t.Fatalf("non-numeric arg should be treated as a config path, not rejected: %v", err)
+	}
+}
+
+func TestServiceName_DiffersPerConfigDir(t *testing.T) {
+	a := autopull.ServiceName("/home/tracker.reinanbr.com/tracker_go/config_auto_pull.json")
+	b := autopull.ServiceName("/home/reinanbr.com/reinanbr_nextjs/config_auto_pull.json")
+	if a == b {
+		t.Fatalf("expected distinct service names, both got %q", a)
+	}
+	if !strings.HasPrefix(a, "autopull-") || !strings.HasPrefix(b, "autopull-") {
+		t.Errorf("expected autopull- prefix, got %q and %q", a, b)
+	}
+}
+
+func TestServiceName_StableForSameConfig(t *testing.T) {
+	cfg := "/etc/auto_pull/config_auto_pull.json"
+	if got, want := autopull.ServiceName(cfg), autopull.ServiceName(cfg); got != want {
+		t.Errorf("expected stable name across calls, got %q and %q", got, want)
 	}
 }
 

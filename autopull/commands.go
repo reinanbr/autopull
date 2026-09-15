@@ -2,6 +2,7 @@ package autopull
 
 import (
 	"fmt"
+	"hash/fnv"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -12,7 +13,33 @@ import (
 	"time"
 )
 
-const defaultServiceName = "autopull"
+// ServiceName derives a stable, unique systemd unit name from a config path so
+// multiple repos on the same host can each run their own supervised instance
+// instead of colliding on a single "autopull" unit.
+func ServiceName(cfgPath string) string {
+	cfgPath = ResolveConfigPath(cfgPath)
+	base := sanitizeServiceName(filepath.Base(filepath.Dir(cfgPath)))
+	h := fnv.New32a()
+	h.Write([]byte(cfgPath))
+	return fmt.Sprintf("autopull-%s-%08x", base, h.Sum32())
+}
+
+func sanitizeServiceName(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '_', r == '.':
+			b.WriteRune(r)
+		default:
+			b.WriteRune('-')
+		}
+	}
+	out := strings.Trim(b.String(), "-")
+	if out == "" {
+		out = "repo"
+	}
+	return out
+}
 
 func CmdInit(cfgPath string) error {
 	cfgPath = ResolveConfigPath(cfgPath)
@@ -217,8 +244,20 @@ func CmdDaemon(cfgPath string) error {
 	}
 
 	pidPath := pidFilePath(cfgPath)
-	if pid, err := readPID(pidPath); err == nil && processRunning(pid) {
-		fmt.Printf("already running in background (pid %d)\n", pid)
+	if lockFile, err := acquireInstanceLock(pidPath); err == nil {
+		// Lock was free — release it immediately so the spawned child can take
+		// it for real. This is still a check-then-act race in theory (two
+		// invocations could both observe the lock as free before either child
+		// starts), but that's now harmless: whichever child starts first wins
+		// the real lock in watch(), and the loser exits immediately instead of
+		// running unsupervised alongside it.
+		lockFile.Close()
+	} else {
+		if pid, pidErr := readPID(pidPath); pidErr == nil {
+			fmt.Printf("already running in background (pid %d)\n", pid)
+		} else {
+			fmt.Println("already running in background")
+		}
 		return nil
 	}
 
@@ -318,7 +357,8 @@ func CmdService(args []string) error {
 			return fmt.Errorf("could not determine service user; set AUTOPULL_SERVICE_USER")
 		}
 
-		servicePath := filepath.Join("/etc/systemd/system", defaultServiceName+".service")
+		svcName := ServiceName(cfgPath)
+		servicePath := filepath.Join("/etc/systemd/system", svcName+".service")
 		content := SystemdUnitContent(execPath, cfgPath, runAsUser)
 
 		if err := os.WriteFile(servicePath, []byte(content), 0644); err != nil {
@@ -328,30 +368,43 @@ func CmdService(args []string) error {
 		if out, err := runCommand("systemctl", "daemon-reload"); err != nil {
 			return fmt.Errorf("systemctl daemon-reload failed: %v\n%s", err, out)
 		}
-		if out, err := runCommand("systemctl", "enable", "--now", defaultServiceName); err != nil {
+		if out, err := runCommand("systemctl", "enable", "--now", svcName); err != nil {
 			return fmt.Errorf("systemctl enable --now failed: %v\n%s", err, out)
 		}
 
-		fmt.Printf("installed and started systemd service: %s\n", defaultServiceName)
+		fmt.Printf("installed and started systemd service: %s\n", svcName)
+		fmt.Printf("  config: %s\n", cfgPath)
+		fmt.Println("pass this same config path to other 'service' subcommands to manage it, e.g.:")
+		fmt.Printf("  autopull service status %s\n", cfgPath)
 		return nil
 
 	case "uninstall":
-		if out, err := runCommand("systemctl", "disable", "--now", defaultServiceName); err != nil {
+		cfgPath := ""
+		if len(args) > 1 {
+			cfgPath = args[1]
+		}
+		svcName := ServiceName(cfgPath)
+		if out, err := runCommand("systemctl", "disable", "--now", svcName); err != nil {
 			// keep going even if service wasn't active
 			fmt.Fprintf(os.Stderr, "warning: disable failed: %v\n%s\n", err, out)
 		}
-		servicePath := filepath.Join("/etc/systemd/system", defaultServiceName+".service")
+		servicePath := filepath.Join("/etc/systemd/system", svcName+".service")
 		if err := os.Remove(servicePath); err != nil && !os.IsNotExist(err) {
 			return fmt.Errorf("failed removing %s: %w", servicePath, err)
 		}
 		if out, err := runCommand("systemctl", "daemon-reload"); err != nil {
 			return fmt.Errorf("systemctl daemon-reload failed: %v\n%s", err, out)
 		}
-		fmt.Printf("uninstalled systemd service: %s\n", defaultServiceName)
+		fmt.Printf("uninstalled systemd service: %s\n", svcName)
 		return nil
 
 	case "start", "stop", "restart", "status":
-		out, err := runCommand("systemctl", action, defaultServiceName)
+		cfgPath := ""
+		if len(args) > 1 {
+			cfgPath = args[1]
+		}
+		svcName := ServiceName(cfgPath)
+		out, err := runCommand("systemctl", action, svcName)
 		if out != "" {
 			fmt.Println(out)
 		}
@@ -362,18 +415,21 @@ func CmdService(args []string) error {
 		if err != nil {
 			return fmt.Errorf("systemctl %s failed: %v", action, err)
 		}
-		fmt.Printf("service %s: %s\n", defaultServiceName, action)
+		fmt.Printf("service %s: %s\n", svcName, action)
 		return nil
 
 	case "logs":
 		lines := "50"
-		if len(args) > 1 {
-			if _, err := strconv.Atoi(args[1]); err != nil {
-				return fmt.Errorf("logs expects a numeric line count")
+		cfgPath := ""
+		for _, a := range args[1:] {
+			if _, err := strconv.Atoi(a); err == nil {
+				lines = a
+			} else {
+				cfgPath = a
 			}
-			lines = args[1]
 		}
-		out, err := runCommand("journalctl", "-u", defaultServiceName, "-n", lines, "--no-pager")
+		svcName := ServiceName(cfgPath)
+		out, err := runCommand("journalctl", "-u", svcName, "-n", lines, "--no-pager")
 		if err != nil {
 			return fmt.Errorf("journalctl failed: %v\n%s", err, out)
 		}

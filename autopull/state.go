@@ -39,6 +39,25 @@ func writePID(path string, pid int) error {
 	return os.WriteFile(path, []byte(strconv.Itoa(pid)), 0644)
 }
 
+// acquireInstanceLock takes an exclusive, non-blocking flock on the pid file so
+// only one watcher process can ever run for a given config at a time. The lock
+// is held for the life of the returned file — keep it referenced (don't let it
+// be garbage collected) until the process exits, at which point the OS releases
+// it automatically. This replaces a racy "read pid, check if alive" dance: two
+// processes starting at nearly the same instant could both observe no running
+// pid before either had written one, and both proceed to run unsupervised.
+func acquireInstanceLock(pidPath string) (*os.File, error) {
+	f, err := os.OpenFile(pidPath, os.O_CREATE|os.O_RDWR, 0644)
+	if err != nil {
+		return nil, err
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		f.Close()
+		return nil, fmt.Errorf("another autopull instance is already running for this config")
+	}
+	return f, nil
+}
+
 func readPID(path string) (int, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {

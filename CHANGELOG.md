@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v1.2.9] - 2026-09-15
+
+### Fixed
+- `autopull service install/uninstall/start/stop/restart/status/logs` now derive a unique systemd unit name per config path (`autopull-<repo-dir>-<hash>`) instead of always writing/managing a single hardcoded `autopull.service`. Previously, installing the service for a second repo silently overwrote the first repo's unit, leaving it with no running (and no auto-restarting) watcher. All `service` subcommands accept an optional trailing config path to select which repo's service to manage, matching the rest of the CLI.
+- Fixed a race in `autopull daemon`/`start`: the "already running" check read a pid file that the child process only wrote *after* starting, so two near-simultaneous invocations could both pass the check and end up running two unsupervised watcher processes against the same repo (duplicate pulls, duplicate `post_pull_command` runs). The watcher now takes an exclusive `flock` on the pid file for its entire lifetime; a losing process exits immediately instead of running alongside the winner.
+
+### Changed
+- Version bumped to v1.2.9.
+
 ## [v1.2.8] - 2026-07-26
 
 ### Changed

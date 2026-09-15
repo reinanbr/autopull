@@ -41,6 +41,13 @@ func watch(ctx context.Context, cfgPath string) {
 	}
 
 	pidPath := pidFilePath(cfgPath)
+	lockFile, err := acquireInstanceLock(pidPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "FATAL: %v (pid file: %s)\n", err, pidPath)
+		os.Exit(1)
+	}
+	defer lockFile.Close()
+
 	if err := writePID(pidPath, os.Getpid()); err != nil {
 		fmt.Fprintf(os.Stderr, "FATAL: could not write pid file: %v\n", err)
 		os.Exit(1)

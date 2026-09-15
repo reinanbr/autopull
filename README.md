@@ -190,23 +190,33 @@ Important:
 
 ### Native systemd management (Linux)
 
-`autopull` can create and manage a systemd unit directly:
+`autopull` can create and manage a systemd unit directly. The unit name is derived
+from the config path (`autopull-<repo-dir>-<hash>`), so **each repo gets its own
+service** — running `service install` for a second repo does not disturb the first:
 
 ```bash
-# requires root privileges to write /etc/systemd/system/autopull.service
+# requires root privileges to write /etc/systemd/system/autopull-<name>-<hash>.service
 sudo autopull service install /etc/auto_pull/config_auto_pull.json
 
-autopull service status
-autopull service logs 200
-sudo autopull service restart
-sudo autopull service stop
-sudo autopull service uninstall
+# pass the same config path to any other 'service' subcommand to target that repo
+autopull service status /etc/auto_pull/config_auto_pull.json
+autopull service logs 200 /etc/auto_pull/config_auto_pull.json
+sudo autopull service restart /etc/auto_pull/config_auto_pull.json
+sudo autopull service stop /etc/auto_pull/config_auto_pull.json
+sudo autopull service uninstall /etc/auto_pull/config_auto_pull.json
 ```
+
+If you omit the config path, it defaults to `./config_auto_pull.json` (same as every
+other command) — so running `service status` etc. from inside the repo you installed
+from also works without repeating the path.
 
 Notes:
 - `service` subcommands are available only on Linux.
 - `install`/`uninstall`/`start`/`stop`/`restart` usually require elevated permissions.
 - Service user is resolved from `AUTOPULL_SERVICE_USER`, then `SUDO_USER`, then `USER`.
+- Upgrading from a version that used a single global `autopull.service`: run
+  `sudo systemctl disable --now autopull && sudo rm /etc/systemd/system/autopull.service`
+  once, then `sudo autopull service install <config>` for each repo you're watching.
 
 ---
 
