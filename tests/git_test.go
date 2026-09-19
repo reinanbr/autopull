@@ -70,6 +70,16 @@ func TestGitRecoveryHints_DirtyOnly(t *testing.T) {
 	if !strings.Contains(joined, "dirty") && !strings.Contains(joined, "Working tree") {
 		t.Error("hints should mention dirty working tree")
 	}
+	// Regression: `git add -A` stages untracked files too, which is how
+	// auto_pull's own config/log/state files have ended up permanently
+	// tracked in watched repos. `git add -u` only stages already-tracked
+	// changes, matching what TrackedChanges actually detects.
+	if strings.Contains(joined, "git add -A") {
+		t.Error("dirty-tree hint must not suggest `git add -A` — use `git add -u` instead")
+	}
+	if !strings.Contains(joined, "git add -u") {
+		t.Error("dirty-tree hint should suggest `git add -u`")
+	}
 }
 
 func TestGitRecoveryHints_AheadOnly(t *testing.T) {
@@ -309,6 +319,52 @@ func TestTrackedChanges_IgnoresUntracked(t *testing.T) {
 	changes, err := autopull.TrackedChanges(dir)
 	if err != nil || len(changes) != 0 {
 		t.Fatalf("expected no changes for untracked-only, got %v %v", changes, err)
+	}
+}
+
+// ─── OwnFileTrackingHints ────────────────────
+//
+// Regression coverage for: a repo where config_auto_pull.json got committed
+// (e.g. by following the old "git add -A" recovery hint) later fails plain
+// `git pull` with "local changes would be overwritten by merge" — even
+// though `autopull status` reports the tree as clean, because
+// --assume-unchanged hides the file from `git status`/TrackedChanges.
+// OwnFileTrackingHints must catch this by checking the index directly.
+
+func TestOwnFileTrackingHints_DetectsTrackedConfigDespiteAssumeUnchanged(t *testing.T) {
+	dir := initGitRepo(t)
+	cfgPath := filepath.Join(dir, "config_auto_pull.json")
+	os.WriteFile(cfgPath, []byte(`{"repo_path":"."}`), 0644)
+	gitCmd(t, dir, "add", "config_auto_pull.json")
+	gitCmd(t, dir, "-c", "user.name=test", "-c", "user.email=t@t.com", "commit", "-m", "oops, committed config")
+
+	// Simulate what silenceOwnFiles does once the file is tracked.
+	gitCmd(t, dir, "update-index", "--assume-unchanged", "config_auto_pull.json")
+	os.WriteFile(cfgPath, []byte(`{"repo_path":".","check_interval_seconds":5}`), 0644)
+
+	if changes, _ := autopull.TrackedChanges(dir); len(changes) != 0 {
+		t.Fatalf("assume-unchanged should hide the file from TrackedChanges, got %v", changes)
+	}
+
+	cfg := &autopull.Config{RepoPath: dir, LogFile: "auto_pull.log"}
+	hints := autopull.OwnFileTrackingHints(cfg, cfgPath)
+	if len(hints) == 0 {
+		t.Fatal("expected a hint for the tracked config file even though git status is silent")
+	}
+	if !strings.Contains(hints[0], "config_auto_pull.json") || !strings.Contains(hints[0], "git rm --cached") {
+		t.Errorf("hint should name the file and how to untrack it, got: %s", hints[0])
+	}
+}
+
+func TestOwnFileTrackingHints_NoneWhenNeverTracked(t *testing.T) {
+	dir := initGitRepo(t)
+	cfgPath := filepath.Join(dir, "config_auto_pull.json")
+	os.WriteFile(cfgPath, []byte(`{"repo_path":"."}`), 0644)
+
+	cfg := &autopull.Config{RepoPath: dir, LogFile: "auto_pull.log"}
+	hints := autopull.OwnFileTrackingHints(cfg, cfgPath)
+	if len(hints) != 0 {
+		t.Errorf("expected no hints for an untracked config file, got %v", hints)
 	}
 }
 

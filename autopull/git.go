@@ -27,8 +27,10 @@ var knownArtifactDirs = []string{
 // generated at runtime that should never be tracked by git.
 var knownTransientSuffixes = []string{".db-shm", ".db-wal", ".db-journal"}
 
-// knownRuntimeFiles are exact filenames that auto_pull writes at runtime.
-var knownRuntimeFiles = []string{".auto_pull.pid", ".auto_pull.state.json"}
+// knownRuntimeFiles are exact filenames that auto_pull writes at runtime, or
+// its own config file under its default name — none of these should ever be
+// tracked by the repo they're watching.
+var knownRuntimeFiles = []string{".auto_pull.pid", ".auto_pull.state.json", "config_auto_pull.json", "auto_pull.log"}
 
 func runGit(dir string, token string, args ...string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), gitTimeout)
@@ -211,7 +213,11 @@ func GitRecoveryHints(ahead, behind int, dirty bool) []string {
 	hints := []string{}
 	if dirty {
 		hints = append(hints,
-			"Working tree is dirty. Resolve with: git add -A && git commit -m \"save local changes\"",
+			// -u (not -A): stages changes to already-tracked files only. -A would also
+			// sweep in any currently-untracked file sitting in the repo root — including
+			// auto_pull's own config/log/state files — permanently tracking them and
+			// making future pulls liable to abort on them. See OwnFileTrackingHints.
+			"Working tree is dirty. Resolve with: git add -u && git commit -m \"save local changes\"",
 			"Or temporarily shelve changes: git stash push -m \"autopull-temp\"",
 			"Or discard local modifications: git reset --hard HEAD",
 		)
@@ -231,6 +237,17 @@ func GitRecoveryHints(ahead, behind int, dirty bool) []string {
 		)
 	}
 	return hints
+}
+
+// gitignoreUntrackCmd builds the ready-to-run shell command that permanently
+// removes a path from tracking: add it to .gitignore, untrack it, and commit
+// the cleanup. This is the only fix that actually works once a path is
+// tracked — --assume-unchanged/--skip-worktree only quiet `git status`, they
+// do not stop `git pull` from refusing with "local changes would be
+// overwritten by merge" the moment origin's history touches that same path.
+func gitignoreUntrackCmd(pattern, path string) string {
+	return fmt.Sprintf("echo '%s' >> .gitignore && git rm --cached %q && git add .gitignore && git commit -m 'chore: gitignore %s'",
+		pattern, path, pattern)
 }
 
 // ArtifactGitignoreHints inspects the dirty file list and returns ready-to-run
@@ -264,10 +281,7 @@ func ArtifactGitignoreHints(statusLines []string) []string {
 			pattern := "*" + suffix
 			if strings.HasSuffix(base, suffix) && !seen[pattern] {
 				seen[pattern] = true
-				cmds = append(cmds,
-					fmt.Sprintf("echo '%s' >> .gitignore && git rm --cached %q && git add .gitignore && git commit -m 'chore: gitignore %s'",
-						pattern, path, pattern),
-				)
+				cmds = append(cmds, gitignoreUntrackCmd(pattern, path))
 			}
 		}
 
@@ -275,10 +289,7 @@ func ArtifactGitignoreHints(statusLines []string) []string {
 		for _, rf := range knownRuntimeFiles {
 			if base == rf && !seen[rf] {
 				seen[rf] = true
-				cmds = append(cmds,
-					fmt.Sprintf("echo '%s' >> .gitignore && git rm --cached %q && git add .gitignore && git commit -m 'chore: gitignore %s'",
-						rf, path, rf),
-				)
+				cmds = append(cmds, gitignoreUntrackCmd(rf, path))
 			}
 		}
 	}

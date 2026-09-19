@@ -141,6 +141,16 @@ func CmdStatus(cfgPath string) error {
 		}
 	}
 
+	if hints := OwnFileTrackingHints(cfg, cfgPath); len(hints) > 0 {
+		fmt.Println("  warn  : auto_pull's own file(s) are tracked by git — this can make `git pull`")
+		fmt.Println("  warn  : abort with \"local changes would be overwritten by merge\" any time")
+		fmt.Println("  warn  : origin's history touches them, even though they show as clean here.")
+		fmt.Println("  warn  : Fix permanently by running:")
+		for _, cmd := range hints {
+			fmt.Printf("  warn  :   %s\n", cmd)
+		}
+	}
+
 	fetchErr := ""
 	if _, err := runGit(cfg.RepoPath, cfg.GithubToken, "fetch", "origin", cfg.Branch); err != nil {
 		fetchErr = err.Error()

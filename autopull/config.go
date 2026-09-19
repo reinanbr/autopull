@@ -225,10 +225,18 @@ func assumeUnchanged(repoPath string, files []string) {
 	runGit(repoPath, "", args...)
 }
 
-// silenceOwnFiles protects auto_pull's runtime files and config from dirtying
-// the working tree. Called at startup and after every hard-reset (which clears
-// the assume-unchanged bit). Also re-writes the config so recovery settings
-// survive the reset.
+// silenceOwnFiles hides auto_pull's own tracked runtime files from `git
+// status` via --assume-unchanged. Called at startup and after every
+// hard-reset (which clears that index bit). Also re-writes the config so
+// recovery settings survive the reset.
+//
+// This only quiets status noise — it does NOT stop `git pull` from aborting
+// with "local changes would be overwritten by merge" the moment origin's
+// history touches the same path (verified: --skip-worktree doesn't prevent
+// that either). The only real fix is to fully untrack the file, which is why
+// OwnFileTrackingHints surfaces a one-time "gitignore + git rm --cached" hint
+// for any of these files it finds tracked, in both the daemon log and
+// `autopull status`.
 func silenceOwnFiles(cfg *Config, cfgPath string, l *logger) {
 	candidates := []string{
 		filepath.Base(pidFilePath(cfgPath)),
@@ -242,9 +250,41 @@ func silenceOwnFiles(cfg *Config, cfgPath string, l *logger) {
 				len(tracked), strings.Join(tracked, ", ")))
 		}
 	}
+	if hints := OwnFileTrackingHints(cfg, cfgPath); len(hints) > 0 && l != nil {
+		l.warn("auto_pull's own file(s) are tracked by git — this can make `git pull` abort with " +
+			"\"local changes would be overwritten by merge\" any time origin's history touches them. " +
+			"Fix permanently by running:")
+		for _, cmd := range hints {
+			l.warn("  " + cmd)
+		}
+	}
 	// Re-write config so any settings (e.g. git_recovery_mode) that were wiped
 	// by a hard-reset are restored from the in-memory copy.
 	if err := writeConfig(cfgPath, configToFile(cfg)); err != nil && l != nil {
 		l.warn(fmt.Sprintf("could not restore config after reset: %v", err))
 	}
+}
+
+// OwnFileTrackingHints returns ready-to-run shell commands to permanently
+// untrack any of auto_pull's own runtime files (pid, state, config, log) that
+// are tracked in the repo's git index. It checks the index directly, rather
+// than the `git status` dirty list that ArtifactGitignoreHints works from,
+// because silenceOwnFiles sets --assume-unchanged on these files once
+// tracked — which hides them from `git status`/TrackedChanges entirely, so
+// the ordinary dirty-file hint never gets a chance to fire for them even
+// though the file being tracked at all is what makes `git pull` liable to
+// abort later.
+func OwnFileTrackingHints(cfg *Config, cfgPath string) []string {
+	candidates := []string{
+		filepath.Base(pidFilePath(cfgPath)),
+		filepath.Base(stateFilePath(cfgPath)),
+		filepath.Base(cfgPath),
+		filepath.Base(cfg.LogFile),
+	}
+	tracked := trackedInIndex(cfg.RepoPath, candidates)
+	cmds := make([]string, 0, len(tracked))
+	for _, f := range tracked {
+		cmds = append(cmds, gitignoreUntrackCmd(f, f))
+	}
+	return cmds
 }

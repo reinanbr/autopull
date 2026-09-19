@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v1.2.11] - 2026-09-19
+
+### Fixed
+- A repo whose `config_auto_pull.json` (or `.auto_pull.pid`/`.auto_pull.state.json`/log file) had accidentally been committed could still fail a plain `git pull` with "local changes would be overwritten by merge" even when `autopull status` reported the tree as clean. Cause: `--assume-unchanged`, which autopull sets on these files once tracked to keep `git status`/`autopull status` quiet, has no effect on git's merge-safety check against the real file content — so `git pull` still refused the moment origin's history touched that same path. `autopull status` and the daemon log now check the git index directly and print a one-time "untrack + gitignore" fix command for any of autopull's own files that are tracked, independent of whether they currently show as dirty.
+- The "working tree is dirty" recovery hint now suggests `git add -u` instead of `git add -A`. `-A` also stages *untracked* files, which is how autopull's own config/log/state files could end up committed into a watched repo in the first place (the root cause of the issue above); `-u` only stages changes to files git already tracks, matching what the dirty-check actually detects.
+
 ## [v1.2.10] - 2026-09-15
 
 ### Fixed
