@@ -44,6 +44,7 @@ func TestNormalizeRecoveryMode(t *testing.T) {
 		{"STASH", "stash"},
 		{"hard-reset", "hard-reset"},
 		{" HARD-RESET ", "hard-reset"},
+		{"hard_reset", "hard-reset"},
 		{"invalid", "off"},
 		{"reset", "off"},
 	}
@@ -231,6 +232,66 @@ func TestLoadConfig_MissingFile(t *testing.T) {
 	_, err := autopull.LoadConfig("/nonexistent/path/config.json")
 	if err == nil {
 		t.Fatal("expected error for missing config file")
+	}
+}
+
+// Regression: an empty or relative repo_path used to be FATAL ("repo_path is
+// required") or resolved against the process cwd ("/" under systemd), which
+// broke any config that was committed or copied between machines.
+func TestLoadConfig_EmptyRepoPathUsesConfigDir(t *testing.T) {
+	dir := t.TempDir()
+	path := writeConfig(t, dir, map[string]any{"branch": "main"})
+	cfg, err := autopull.LoadConfig(path)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.RepoPath != dir {
+		t.Errorf("RepoPath = %q, want %q", cfg.RepoPath, dir)
+	}
+}
+
+func TestLoadConfig_RelativeRepoPathIsRelativeToConfig(t *testing.T) {
+	dir := t.TempDir()
+	sub := filepath.Join(dir, "deploy")
+	os.MkdirAll(sub, 0755)
+	path := writeConfig(t, sub, map[string]any{"repo_path": "..", "post_pull_workdir": "web"})
+
+	orig, _ := os.Getwd()
+	os.Chdir(t.TempDir()) // cwd must not matter
+	defer os.Chdir(orig)
+
+	cfg, err := autopull.LoadConfig(path)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.RepoPath != dir {
+		t.Errorf("RepoPath = %q, want %q", cfg.RepoPath, dir)
+	}
+	if want := filepath.Join(dir, "web"); cfg.PostPullWorkdir != want {
+		t.Errorf("PostPullWorkdir = %q, want %q", cfg.PostPullWorkdir, want)
+	}
+}
+
+// LoadConfig is called on every tick; it must never rewrite the file (a
+// rewritten committed config is what blocked every later pull).
+func TestLoadConfig_DoesNotModifyFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config_auto_pull.json")
+	orig := []byte("{\"branch\":\"main\"}")
+	os.WriteFile(path, orig, 0644)
+	if _, err := autopull.LoadConfig(path); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := os.ReadFile(path); string(got) != string(orig) {
+		t.Errorf("config was modified: %q", got)
+	}
+}
+
+func TestLoadDotEnvToken_ExportPrefix(t *testing.T) {
+	dir := t.TempDir()
+	writeEnvFile(t, dir, "export AUTOPULL_TOKEN=tok\n")
+	if got := autopull.LoadDotEnvToken(dir); got != "tok" {
+		t.Errorf("got %q, want tok", got)
 	}
 }
 

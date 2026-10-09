@@ -2,6 +2,26 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v1.2.12] - 2026-10-09
+
+### Fixed
+- **The watcher stopped pulling in repos where `config_auto_pull.json` already existed in git.** On every startup (and after every hard-reset) autopull rewrote its own config file, reformatting it and filling in defaults. A committed config therefore always looked locally modified; `--assume-unchanged` hid that from `git status`, but every later pull that touched the file aborted with "local changes would be overwritten by merge", indefinitely. The config is now never rewritten (only `autopull init` writes it), and the stale `--assume-unchanged` bits set by older versions are cleared on startup.
+- autopull's own files (config, state) are now protected around every merge and hard-reset: a locally edited committed config is kept (local wins) instead of blocking the pull; an untracked local config no longer blocks a pull that adds the same file upstream; and a config is restored if upstream untracks it (e.g. after someone commits the recommended `git rm --cached`) instead of being deleted from the server.
+- An empty `repo_path` was fatal, and a relative one was resolved against the process cwd (`/` under systemd). Both now resolve relative to the config file's directory, so a committed config works on every machine. `post_pull_workdir` relative paths resolve against `repo_path`.
+- `git_recovery_mode: stash` used `--include-untracked`, which also stashed `.env` (losing the token) and an un-ignored config, leaving the watcher unable to fetch or reload. It now stashes tracked changes only.
+- `hard-reset` recovery that moved the branch to new commits skipped `post_pull_command`, the notification and the pull counter. Any update of HEAD now counts as a pull.
+- `git fetch` now uses an explicit refspec, so `origin/<branch>` is also updated in single-branch clones (previously it could silently stay stale forever).
+- Fetch/merge/reset get a 2-minute timeout instead of 15s, so a large fetch over a slow link can finish instead of timing out on every tick.
+- `autopull daemon` validated nothing and discarded the child's stderr, so a bad config reported "started" while the process died immediately. It now validates first, sends startup errors to the log, and reports an immediate exit.
+
+### Changed
+- Updates use `git merge --ff-only origin/<branch>` instead of `git pull`: no second network round-trip, independent of `pull.rebase`/`pull.ff` settings, and never a merge commit on the server.
+- Persistent problems (dirty tree, diverged branch, blocked merge, invalid config) are logged once until the situation changes instead of every few seconds; the backoff line is gone (the error line now says when it retries).
+- The first check runs immediately on startup instead of after one interval.
+- autopull adds its untracked runtime files to `.git/info/exclude` (local, never committed) on startup and on `init`, so `git add -A` can't commit them by accident.
+- `autopull init` detects the repo from the config's location and writes `repo_path` relative to the config when it is inside the repo.
+- `git_recovery_mode` also accepts `hard_reset`; `.env` accepts `export KEY=value` lines; new hints for untracked-file collisions and non-fast-forward updates.
+
 ## [v1.2.11] - 2026-09-19
 
 ### Fixed

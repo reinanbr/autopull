@@ -25,6 +25,31 @@ type RuntimeState struct {
 type repoState struct {
 	consecutiveErrors int
 	backoffUntil      time.Time
+	notices           map[string]bool
+}
+
+// notice runs emit only the first time key is seen, so a persistent problem
+// (dirty tree, diverged branch, blocked merge) is logged once instead of
+// flooding the log every few seconds until it is fixed.
+func (st *repoState) notice(key string, emit func()) {
+	if st.notices == nil {
+		st.notices = map[string]bool{}
+	}
+	if st.notices[key] {
+		return
+	}
+	st.notices[key] = true
+	emit()
+}
+
+// clearNotice forgets notices whose key starts with prefix ("" = all), so
+// they are logged again if the problem comes back.
+func (st *repoState) clearNotice(prefix string) {
+	for k := range st.notices {
+		if strings.HasPrefix(k, prefix) {
+			delete(st.notices, k)
+		}
+	}
 }
 
 func pidFilePath(cfgPath string) string {

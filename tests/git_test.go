@@ -167,6 +167,21 @@ func TestGitPullErrorHints_UnknownError(t *testing.T) {
 	}
 }
 
+func TestGitPullErrorHints_UntrackedCollision(t *testing.T) {
+	msg := "error: The following untracked working tree files would be overwritten by merge:\n\tconfig_auto_pull.json"
+	hints := autopull.GitPullErrorHints(msg)
+	if len(hints) == 0 || !strings.Contains(hints[0], "Untracked") {
+		t.Errorf("expected untracked-collision hint, got %v", hints)
+	}
+}
+
+func TestGitPullErrorHints_NotFastForward(t *testing.T) {
+	hints := autopull.GitPullErrorHints("fatal: Not possible to fast-forward, aborting.")
+	if len(hints) == 0 || !strings.Contains(hints[0], "diverged") {
+		t.Errorf("expected divergence hint, got %v", hints)
+	}
+}
+
 // ─── ArtifactGitignoreHints ──────────────────
 
 func TestArtifactGitignoreHints_NodeModules(t *testing.T) {
@@ -338,7 +353,7 @@ func TestOwnFileTrackingHints_DetectsTrackedConfigDespiteAssumeUnchanged(t *test
 	gitCmd(t, dir, "add", "config_auto_pull.json")
 	gitCmd(t, dir, "-c", "user.name=test", "-c", "user.email=t@t.com", "commit", "-m", "oops, committed config")
 
-	// Simulate what silenceOwnFiles does once the file is tracked.
+	// Simulate what autopull <= v1.2.11 did once the file was tracked.
 	gitCmd(t, dir, "update-index", "--assume-unchanged", "config_auto_pull.json")
 	os.WriteFile(cfgPath, []byte(`{"repo_path":".","check_interval_seconds":5}`), 0644)
 

@@ -53,7 +53,7 @@ func LoadDotEnvToken(baseDir string) string {
 		if len(parts) != 2 {
 			continue
 		}
-		key := strings.TrimSpace(parts[0])
+		key := strings.TrimSpace(strings.TrimPrefix(parts[0], "export "))
 		val := strings.Trim(strings.TrimSpace(parts[1]), `"'`)
 		if key == "AUTOPULL_TOKEN" || key == "GITHUB_TOKEN" {
 			return val
@@ -125,6 +125,25 @@ func LoadConfig(path string) (*Config, error) {
 		GitRecoveryMode:      NormalizeRecoveryMode(cf.GitRecoveryMode),
 	}
 
+	// repo_path and post_pull_workdir are resolved relative to the config
+	// file's directory, not the process cwd — the cwd is "/" under systemd and
+	// arbitrary under `autopull daemon`. An empty repo_path means "the repo
+	// this config lives in", which keeps a committed config portable across
+	// machines instead of pinning one host's absolute path.
+	cfgDir := filepath.Dir(path)
+	if abs, err := filepath.Abs(cfgDir); err == nil {
+		cfgDir = abs
+	}
+	if strings.TrimSpace(cfg.RepoPath) == "" {
+		cfg.RepoPath = cfgDir
+	} else if !filepath.IsAbs(cfg.RepoPath) {
+		cfg.RepoPath = filepath.Join(cfgDir, cfg.RepoPath)
+	}
+	cfg.RepoPath = filepath.Clean(cfg.RepoPath)
+	if cfg.PostPullWorkdir != "" && !filepath.IsAbs(cfg.PostPullWorkdir) {
+		cfg.PostPullWorkdir = filepath.Join(cfg.RepoPath, cfg.PostPullWorkdir)
+	}
+
 	// defaults
 	if cfg.Branch == "" {
 		cfg.Branch = "main"
@@ -136,18 +155,26 @@ func LoadConfig(path string) (*Config, error) {
 		cfg.LogFile = "auto_pull.log"
 	}
 
-	// token resolution: env var → .env file in repo dir → empty
+	// token resolution: env var → .env in repo dir → .env next to config → empty
 	token := tokenFromEnv()
 	if token == "" {
-		baseDir := cfg.RepoPath
-		if baseDir == "" {
-			baseDir = filepath.Dir(path)
-		}
-		token = LoadDotEnvToken(baseDir)
+		token = LoadDotEnvToken(cfg.RepoPath)
+	}
+	if token == "" && cfgDir != cfg.RepoPath {
+		token = LoadDotEnvToken(cfgDir)
 	}
 	cfg.GithubToken = token
 
 	return cfg, nil
+}
+
+// resolveLogPath returns the absolute log path; a relative log_file is
+// relative to the config file's directory.
+func resolveLogPath(cfg *Config, cfgPath string) string {
+	if filepath.IsAbs(cfg.LogFile) {
+		return cfg.LogFile
+	}
+	return filepath.Join(filepath.Dir(cfgPath), cfg.LogFile)
 }
 
 func NormalizeRecoveryMode(v string) string {
@@ -157,23 +184,10 @@ func NormalizeRecoveryMode(v string) string {
 		return "off"
 	case "stash":
 		return "stash"
-	case "hard-reset":
+	case "hard-reset", "hard_reset", "hardreset":
 		return "hard-reset"
 	default:
 		return "off"
-	}
-}
-
-func configToFile(cfg *Config) configFile {
-	return configFile{
-		RepoPath:             cfg.RepoPath,
-		Branch:               cfg.Branch,
-		CheckIntervalSeconds: cfg.CheckIntervalSeconds,
-		PostPullCommand:      cfg.PostPullCommand,
-		PostPullWorkdir:      cfg.PostPullWorkdir,
-		LogFile:              cfg.LogFile,
-		NotifyOnPull:         cfg.NotifyOnPull,
-		GitRecoveryMode:      cfg.GitRecoveryMode,
 	}
 }
 
@@ -185,7 +199,7 @@ func writeConfig(path string, cfg configFile) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
 		return err
 	}
-	return os.WriteFile(path, data, 0644)
+	return os.WriteFile(path, append(data, '\n'), 0644)
 }
 
 func detectBranch(repoPath string) string {
@@ -194,97 +208,4 @@ func detectBranch(repoPath string) string {
 		return "main"
 	}
 	return branch
-}
-
-// trackedInIndex returns only those files (relative to repoPath) that git tracks.
-func trackedInIndex(repoPath string, files []string) []string {
-	if len(files) == 0 {
-		return nil
-	}
-	args := append([]string{"ls-files", "--"}, files...)
-	out, err := runGit(repoPath, "", args...)
-	if err != nil || out == "" {
-		return nil
-	}
-	var tracked []string
-	for _, f := range strings.Split(strings.TrimSpace(out), "\n") {
-		if f != "" {
-			tracked = append(tracked, f)
-		}
-	}
-	return tracked
-}
-
-// assumeUnchanged marks files with --assume-unchanged so git status ignores
-// their local modifications. Only meaningful for files already in the index.
-func assumeUnchanged(repoPath string, files []string) {
-	if len(files) == 0 {
-		return
-	}
-	args := append([]string{"update-index", "--assume-unchanged"}, files...)
-	runGit(repoPath, "", args...)
-}
-
-// silenceOwnFiles hides auto_pull's own tracked runtime files from `git
-// status` via --assume-unchanged. Called at startup and after every
-// hard-reset (which clears that index bit). Also re-writes the config so
-// recovery settings survive the reset.
-//
-// This only quiets status noise — it does NOT stop `git pull` from aborting
-// with "local changes would be overwritten by merge" the moment origin's
-// history touches the same path (verified: --skip-worktree doesn't prevent
-// that either). The only real fix is to fully untrack the file, which is why
-// OwnFileTrackingHints surfaces a one-time "gitignore + git rm --cached" hint
-// for any of these files it finds tracked, in both the daemon log and
-// `autopull status`.
-func silenceOwnFiles(cfg *Config, cfgPath string, l *logger) {
-	candidates := []string{
-		filepath.Base(pidFilePath(cfgPath)),
-		filepath.Base(stateFilePath(cfgPath)),
-		filepath.Base(cfgPath),
-	}
-	if tracked := trackedInIndex(cfg.RepoPath, candidates); len(tracked) > 0 {
-		assumeUnchanged(cfg.RepoPath, tracked)
-		if l != nil {
-			l.info(fmt.Sprintf("silenced %d tracked runtime file(s) via --assume-unchanged: %s",
-				len(tracked), strings.Join(tracked, ", ")))
-		}
-	}
-	if hints := OwnFileTrackingHints(cfg, cfgPath); len(hints) > 0 && l != nil {
-		l.warn("auto_pull's own file(s) are tracked by git — this can make `git pull` abort with " +
-			"\"local changes would be overwritten by merge\" any time origin's history touches them. " +
-			"Fix permanently by running:")
-		for _, cmd := range hints {
-			l.warn("  " + cmd)
-		}
-	}
-	// Re-write config so any settings (e.g. git_recovery_mode) that were wiped
-	// by a hard-reset are restored from the in-memory copy.
-	if err := writeConfig(cfgPath, configToFile(cfg)); err != nil && l != nil {
-		l.warn(fmt.Sprintf("could not restore config after reset: %v", err))
-	}
-}
-
-// OwnFileTrackingHints returns ready-to-run shell commands to permanently
-// untrack any of auto_pull's own runtime files (pid, state, config, log) that
-// are tracked in the repo's git index. It checks the index directly, rather
-// than the `git status` dirty list that ArtifactGitignoreHints works from,
-// because silenceOwnFiles sets --assume-unchanged on these files once
-// tracked — which hides them from `git status`/TrackedChanges entirely, so
-// the ordinary dirty-file hint never gets a chance to fire for them even
-// though the file being tracked at all is what makes `git pull` liable to
-// abort later.
-func OwnFileTrackingHints(cfg *Config, cfgPath string) []string {
-	candidates := []string{
-		filepath.Base(pidFilePath(cfgPath)),
-		filepath.Base(stateFilePath(cfgPath)),
-		filepath.Base(cfgPath),
-		filepath.Base(cfg.LogFile),
-	}
-	tracked := trackedInIndex(cfg.RepoPath, candidates)
-	cmds := make([]string, 0, len(tracked))
-	for _, f := range tracked {
-		cmds = append(cmds, gitignoreUntrackCmd(f, f))
-	}
-	return cmds
 }

@@ -43,16 +43,28 @@ func sanitizeServiceName(s string) string {
 
 func CmdInit(cfgPath string) error {
 	cfgPath = ResolveConfigPath(cfgPath)
-	repoRoot, err := runGit(".", "", "rev-parse", "--show-toplevel")
-	if err != nil {
-		return fmt.Errorf("init requires a git repository: %w", err)
-	}
 	if _, err := os.Stat(cfgPath); err == nil {
-		return fmt.Errorf("config already exists: %s", cfgPath)
+		return fmt.Errorf("config already exists: %s (start it with 'autopull start', or delete it to re-run init)", cfgPath)
+	}
+	// Prefer the repo the config will live in; fall back to the cwd's repo
+	// for configs kept outside the work tree (e.g. /etc/autopull).
+	cfgDir := filepath.Dir(cfgPath)
+	repoRoot, err := repoTopLevel(cfgDir)
+	if err != nil {
+		if repoRoot, err = repoTopLevel("."); err != nil {
+			return fmt.Errorf("init requires a git repository: %w", err)
+		}
+	}
+	// Inside the repo, store repo_path relative to the config so the file
+	// keeps working if the repo is moved or cloned on another machine.
+	repoPathValue := repoRoot
+	if rel, err := filepath.Rel(filepath.Dir(realPath(cfgPath)), repoRoot); err == nil &&
+		rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		repoPathValue = rel
 	}
 	branch := detectBranch(repoRoot)
 	cf := configFile{
-		RepoPath:             repoRoot,
+		RepoPath:             repoPathValue,
 		Branch:               branch,
 		CheckIntervalSeconds: 5,
 		PostPullCommand:      "",
@@ -67,6 +79,8 @@ func CmdInit(cfgPath string) error {
 	fmt.Printf("Created %s\n", cfgPath)
 	fmt.Printf("  repo   : %s\n", repoRoot)
 	fmt.Printf("  branch : %s\n", branch)
+	// Keep the config and runtime files out of `git add -A` (local only).
+	prepareOwnFiles(&Config{RepoPath: repoRoot, LogFile: cf.LogFile}, cfgPath, nil)
 	fmt.Println()
 	fmt.Println("For private repos, set your token in .env:")
 	fmt.Println("  echo 'AUTOPULL_TOKEN=ghp_xxxx' >> .env")
@@ -80,10 +94,7 @@ func CmdStatus(cfgPath string) error {
 	if err != nil {
 		return err
 	}
-	logPath := cfg.LogFile
-	if !filepath.IsAbs(logPath) {
-		logPath = filepath.Join(filepath.Dir(cfgPath), logPath)
-	}
+	logPath := resolveLogPath(cfg, cfgPath)
 	pidPath := pidFilePath(cfgPath)
 	pid, pidErr := readPID(pidPath)
 	running := pidErr == nil && processRunning(pid)
@@ -125,7 +136,9 @@ func CmdStatus(cfgPath string) error {
 		fmt.Printf("  branch: %s (config: %s)\n", branch, cfg.Branch)
 	}
 
+	_, own := ownFilesInRepo(cfg, cfgPath)
 	changes, err := TrackedChanges(cfg.RepoPath)
+	changes = filterOwnChanges(changes, own)
 	if err != nil {
 		fmt.Printf("  dirty : check failed: %v\n", err)
 	} else if len(changes) == 0 {
@@ -142,18 +155,16 @@ func CmdStatus(cfgPath string) error {
 	}
 
 	if hints := OwnFileTrackingHints(cfg, cfgPath); len(hints) > 0 {
-		fmt.Println("  warn  : auto_pull's own file(s) are tracked by git — this can make `git pull`")
-		fmt.Println("  warn  : abort with \"local changes would be overwritten by merge\" any time")
-		fmt.Println("  warn  : origin's history touches them, even though they show as clean here.")
-		fmt.Println("  warn  : Fix permanently by running:")
+		fmt.Println("  warn  : autopull's own file(s) are committed in this repo. The watcher protects")
+		fmt.Println("  warn  : them during pulls, but untracking them is cleaner. Run once, from the repo root:")
 		for _, cmd := range hints {
 			fmt.Printf("  warn  :   %s\n", cmd)
 		}
 	}
 
 	fetchErr := ""
-	if _, err := runGit(cfg.RepoPath, cfg.GithubToken, "fetch", "origin", cfg.Branch); err != nil {
-		fetchErr = err.Error()
+	if out, err := fetchBranch(cfg.RepoPath, cfg.Branch, cfg.GithubToken); err != nil {
+		fetchErr = strings.TrimSpace(err.Error() + " " + out)
 	}
 	if fetchErr != "" {
 		fmt.Printf("  remote: fetch failed: %s\n", fetchErr)
@@ -191,10 +202,7 @@ func CmdLogs(cfgPath string, lines int) error {
 	if err != nil {
 		return err
 	}
-	logPath := cfg.LogFile
-	if !filepath.IsAbs(logPath) {
-		logPath = filepath.Join(filepath.Dir(cfgPath), logPath)
-	}
+	logPath := resolveLogPath(cfg, cfgPath)
 	out, err := TailFile(logPath, lines)
 	if err != nil {
 		return err
@@ -229,14 +237,17 @@ func CmdDryRun(cfgPath string) error {
 	fmt.Println("OK")
 
 	fmt.Print("  fetch   : ")
-	if _, err := runGit(cfg.RepoPath, cfg.GithubToken, "fetch", "origin", cfg.Branch); err != nil {
-		fmt.Printf("FAIL — %v\n", err)
+	if out, err := fetchBranch(cfg.RepoPath, cfg.Branch, cfg.GithubToken); err != nil {
+		fmt.Printf("FAIL — %v\n%s\n", err, out)
+		for _, hint := range GitPullErrorHints(err.Error() + "\n" + out) {
+			fmt.Printf("  hint    : %s\n", hint)
+		}
 		return err
 	}
 	fmt.Println("OK")
 
 	fmt.Print("  remote  : ")
-	remote, err := runGit(cfg.RepoPath, cfg.GithubToken, "rev-parse", fmt.Sprintf("origin/%s", cfg.Branch))
+	remote, err := runGit(cfg.RepoPath, "", "rev-parse", fmt.Sprintf("origin/%s", cfg.Branch))
 	if err != nil {
 		fmt.Printf("FAIL — %v\n", err)
 		return err
@@ -251,6 +262,14 @@ func CmdDaemon(cfgPath string) error {
 	cfgPath = ResolveConfigPath(cfgPath)
 	if _, err := os.Stat(cfgPath); err != nil {
 		return fmt.Errorf("config file not found: %s", cfgPath)
+	}
+	// Validate up front: the detached child's errors would otherwise vanish.
+	cfg, err := LoadConfig(cfgPath)
+	if err != nil {
+		return err
+	}
+	if err := EnsureGitRepo(cfg.RepoPath); err != nil {
+		return err
 	}
 
 	pidPath := pidFilePath(cfgPath)
@@ -282,15 +301,33 @@ func CmdDaemon(cfgPath string) error {
 	}
 	defer devNull.Close()
 
+	// The child's stderr goes to its log, so startup failures (FATAL lines)
+	// are visible via `autopull logs` instead of being discarded.
+	logPath := resolveLogPath(cfg, cfgPath)
+	stderr, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		stderr = devNull
+	} else {
+		defer stderr.Close()
+	}
+
 	cmd := exec.Command(exe, cfgPath)
 	cmd.Stdin = devNull
 	cmd.Stdout = devNull
-	cmd.Stderr = devNull
+	cmd.Stderr = stderr
 	cmd.Env = os.Environ()
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("failed to start daemon: %w", err)
+	}
+
+	exited := make(chan error, 1)
+	go func() { exited <- cmd.Wait() }()
+	select {
+	case err := <-exited:
+		return fmt.Errorf("daemon exited right after starting (%v); see %s or run 'autopull %s' in the foreground", err, logPath, cfgPath)
+	case <-time.After(time.Second):
 	}
 
 	fmt.Printf("autopull started in background (pid %d)\n", cmd.Process.Pid)

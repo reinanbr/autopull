@@ -11,7 +11,15 @@ import (
 	"time"
 )
 
-const gitTimeout = 15 * time.Second
+// gitTimeout bounds local git commands. networkTimeout bounds commands that
+// talk to the remote or rewrite the work tree (fetch, merge, reset): a large
+// fetch over a slow link can legitimately take longer than 15s, and timing it
+// out every tick would leave the watcher retrying forever without ever
+// completing a single update.
+const (
+	gitTimeout     = 15 * time.Second
+	networkTimeout = 2 * time.Minute
+)
 
 // knownArtifactDirs are top-level directory names that are typically generated
 // by build tools and should not be tracked by git.
@@ -33,7 +41,11 @@ var knownTransientSuffixes = []string{".db-shm", ".db-wal", ".db-journal"}
 var knownRuntimeFiles = []string{".auto_pull.pid", ".auto_pull.state.json", "config_auto_pull.json", "auto_pull.log"}
 
 func runGit(dir string, token string, args ...string) (string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), gitTimeout)
+	return runGitTimeout(dir, token, gitTimeout, args...)
+}
+
+func runGitTimeout(dir string, token string, timeout time.Duration, args ...string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, "git", args...)
@@ -70,7 +82,7 @@ func runGit(dir string, token string, args ...string) (string, error) {
 	}
 
 	if ctx.Err() == context.DeadlineExceeded {
-		return strings.TrimSpace(string(out)), fmt.Errorf("git command timed out after %s", gitTimeout)
+		return strings.TrimSpace(string(out)), fmt.Errorf("git %s timed out after %s", args[0], timeout)
 	}
 
 	return strings.TrimSpace(string(out)), err
@@ -109,15 +121,31 @@ func localCommit(dir string) (string, error) {
 	return runGit(dir, "", "rev-parse", "HEAD")
 }
 
-func remoteCommit(dir, branch, token string) (string, error) {
-	if _, err := runGit(dir, token, "fetch", "origin", branch); err != nil {
-		return "", fmt.Errorf("git fetch failed: %w", err)
-	}
-	return runGit(dir, token, "rev-parse", fmt.Sprintf("origin/%s", branch))
+// fetchBranch updates refs/remotes/origin/<branch> with an explicit refspec,
+// so it also works in single-branch clones whose configured fetch refspec
+// doesn't cover <branch> (a plain `git fetch origin <branch>` then only
+// updates FETCH_HEAD and origin/<branch> silently goes stale).
+func fetchBranch(dir, branch, token string) (string, error) {
+	refspec := fmt.Sprintf("+refs/heads/%s:refs/remotes/origin/%s", branch, branch)
+	return runGitTimeout(dir, token, networkTimeout, "fetch", "--no-tags", "origin", refspec)
 }
 
-func pull(dir, branch, token string) (string, error) {
-	return runGit(dir, token, "pull", "origin", branch)
+func remoteCommit(dir, branch, token string) (string, error) {
+	if out, err := fetchBranch(dir, branch, token); err != nil {
+		if out != "" {
+			return "", fmt.Errorf("%w: %s", err, out)
+		}
+		return "", err
+	}
+	return runGit(dir, "", "rev-parse", fmt.Sprintf("origin/%s", branch))
+}
+
+// mergeFastForward advances the checked-out branch to the already-fetched
+// origin/<branch>. Unlike `git pull` it needs no second network round-trip,
+// ignores the user's pull.rebase/pull.ff settings, and can never create a
+// merge commit on the server.
+func mergeFastForward(dir, branch string) (string, error) {
+	return runGitTimeout(dir, "", networkTimeout, "merge", "--ff-only", fmt.Sprintf("origin/%s", branch))
 }
 
 func ShortHash(s string) string {
@@ -202,11 +230,14 @@ func aheadBehind(path, branch string) (int, int, error) {
 func autoStash(path string) (string, error) {
 	stamp := time.Now().Format("20060102-150405")
 	msg := fmt.Sprintf("autopull-auto-stash-%s", stamp)
-	return runGit(path, "", "stash", "push", "--include-untracked", "-m", msg)
+	// Tracked changes only: they are what blocks the pull. --include-untracked
+	// would also stash .env (losing the token) and, when not gitignored,
+	// autopull's own config, leaving the watcher unable to fetch or reload.
+	return runGitTimeout(path, "", networkTimeout, "stash", "push", "-m", msg)
 }
 
 func autoHardReset(path, branch string) (string, error) {
-	return runGit(path, "", "reset", "--hard", fmt.Sprintf("origin/%s", branch))
+	return runGitTimeout(path, "", networkTimeout, "reset", "--hard", fmt.Sprintf("origin/%s", branch))
 }
 
 func GitRecoveryHints(ahead, behind int, dirty bool) []string {
@@ -310,6 +341,15 @@ func GitPullErrorHints(msg string) []string {
 		strings.Contains(raw, "unknown revision"):
 		hints = append(hints,
 			"Branch reference not found on origin. Confirm config.branch and run: git branch -r",
+		)
+	case strings.Contains(raw, "untracked working tree files would be"):
+		hints = append(hints,
+			"Untracked local files collide with files added upstream. Move or delete them (or commit them) so the update can be applied.",
+		)
+	case strings.Contains(raw, "not possible to fast-forward"),
+		strings.Contains(raw, "diverging branches"):
+		hints = append(hints,
+			"Local branch has diverged from origin. To mirror remote exactly: git fetch origin && git reset --hard origin/<branch> (or set git_recovery_mode to hard-reset)",
 		)
 	case strings.Contains(raw, "merge conflict"),
 		strings.Contains(raw, "conflict"):

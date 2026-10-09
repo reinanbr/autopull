@@ -87,11 +87,11 @@ Changes to `check_interval_seconds` reset the polling timer immediately.
 
 | Field | Default | Description |
 |---|---|---|
-| `repo_path` | — | Absolute path to the local repository *(required)* |
+| `repo_path` | config's directory | Path to the local repository (absolute, or relative to the config file) |
 | `branch` | `main` | Branch to track |
 | `check_interval_seconds` | `5` | Polling interval |
 | `post_pull_command` | — | Shell command to run after each pull |
-| `post_pull_workdir` | `repo_path` | Working directory for the post-pull command |
+| `post_pull_workdir` | `repo_path` | Working directory for the post-pull command (relative paths are relative to `repo_path`) |
 | `log_file` | `auto_pull.log` | Log file path (absolute or relative to config) |
 | `notify_on_pull` | `true` | Desktop notification on pull (Linux: `notify-send`, macOS: `osascript`) |
 | `git_recovery_mode` | `off` | Auto-recovery strategy when git state blocks pull: `off`, `stash`, `hard-reset` |
@@ -100,7 +100,7 @@ Changes to `check_interval_seconds` reset the polling timer immediately.
 
 `git_recovery_mode` values:
 - `off`: only diagnose and log exact recovery commands.
-- `stash`: auto-stash local changes (`git stash push --include-untracked`) and continue.
+- `stash`: auto-stash local tracked changes (`git stash push`, untracked files such as `.env` are left alone) and continue.
 - `hard-reset`: force sync to `origin/<branch>` when local branch is ahead/diverged (destructive).
 
 Recommended for deployment clones: keep daemon runtime files ignored in the application repository.
@@ -128,7 +128,7 @@ echo 'AUTOPULL_TOKEN=ghp_xxxxxxxxxxxx' >> /srv/myapp/.env
 echo '.env' >> /srv/myapp/.gitignore
 ```
 
-Resolution order: `AUTOPULL_TOKEN` → `GITHUB_TOKEN` → `.env` in `repo_path`.  
+Resolution order: `AUTOPULL_TOKEN` → `GITHUB_TOKEN` → `.env` in `repo_path` → `.env` next to the config file.  
 Tokens set in `config_auto_pull.json` are rejected at startup.
 
 ---
@@ -228,7 +228,7 @@ every N seconds
   ├── git fetch origin <branch>
   ├── compare local HEAD with origin/<branch>
   ├── dirty check — skip pull if tracked files have uncommitted changes
-  ├── if hashes differ → git pull origin <branch>
+  ├── if hashes differ → git merge --ff-only origin/<branch>
   └── run post_pull_command via sh -c
 ```
 

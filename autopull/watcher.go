@@ -57,11 +57,7 @@ func watch(ctx context.Context, cfgPath string) {
 	statePath := stateFilePath(cfgPath)
 	runtimeState := loadRuntimeState(statePath)
 
-	logPath := cfg.LogFile
-	if !filepath.IsAbs(logPath) {
-		logPath = filepath.Join(filepath.Dir(cfgPath), logPath)
-	}
-
+	logPath := resolveLogPath(cfg, cfgPath)
 	l, err := newLogger(logPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "FATAL: could not open log file: %v\n", err)
@@ -71,6 +67,7 @@ func watch(ctx context.Context, cfgPath string) {
 
 	l.info("═══════════════════════════════════════════")
 	l.info("         auto_pull started")
+	l.info(fmt.Sprintf("  config  : %s", cfgPath))
 	l.info(fmt.Sprintf("  repo    : %s", cfg.RepoPath))
 	l.info(fmt.Sprintf("  branch  : %s", cfg.Branch))
 	l.info(fmt.Sprintf("  interval: %ds", cfg.CheckIntervalSeconds))
@@ -84,73 +81,86 @@ func watch(ctx context.Context, cfgPath string) {
 	}
 	l.info("═══════════════════════════════════════════")
 
-	// Silence auto_pull's own runtime files at startup so they never dirty the
-	// working tree and block pulls.
-	silenceOwnFiles(cfg, cfgPath, l)
+	prepareOwnFiles(cfg, cfgPath, l)
 
 	interval := time.Duration(cfg.CheckIntervalSeconds) * time.Second
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	st := &repoState{}
+	first := true
 
 	for {
-		select {
-		case <-ctx.Done():
-			l.info("shutting down (signal received)")
-			return
-		case <-ticker.C:
-		}
-
-		newCfg, err := LoadConfig(cfgPath)
-		if err != nil {
-			l.warn(fmt.Sprintf("invalid config, keeping previous: %v", err))
-		} else {
-			newInterval := time.Duration(newCfg.CheckIntervalSeconds) * time.Second
-			if newInterval != interval {
-				interval = newInterval
-				ticker.Reset(interval)
+		if !first {
+			select {
+			case <-ctx.Done():
+				l.info("shutting down (signal received)")
+				return
+			case <-ticker.C:
 			}
-			cfg = newCfg
+
+			newCfg, err := LoadConfig(cfgPath)
+			if err != nil {
+				st.notice("config:"+err.Error(), func() {
+					l.warn(fmt.Sprintf("invalid config, keeping previous: %v", err))
+				})
+			} else {
+				st.clearNotice("config:")
+				newInterval := time.Duration(newCfg.CheckIntervalSeconds) * time.Second
+				if newInterval != interval {
+					interval = newInterval
+					ticker.Reset(interval)
+					l.info(fmt.Sprintf("check interval changed to %ds", newCfg.CheckIntervalSeconds))
+				}
+				cfg = newCfg
+			}
 		}
+		first = false
 
 		if time.Now().Before(st.backoffUntil) {
-			l.warn(fmt.Sprintf("in backoff until %s", st.backoffUntil.Format(time.RFC3339)))
 			continue
 		}
 
 		processRepo(cfg, cfgPath, st, runtimeState, l)
 
 		if err := saveRuntimeState(statePath, runtimeState); err != nil {
-			l.warn(fmt.Sprintf("could not persist state: %v", err))
+			st.notice("state:"+err.Error(), func() {
+				l.warn(fmt.Sprintf("could not persist state: %v", err))
+			})
 		}
 	}
 }
 
+func (st *repoState) fail(rs *RuntimeState, l *logger, what string, err error) {
+	st.consecutiveErrors++
+	wait := BackoffDuration(st.consecutiveErrors)
+	st.backoffUntil = time.Now().Add(wait)
+	rs.ConsecutiveErrors = st.consecutiveErrors
+	rs.BackoffUntil = st.backoffUntil
+	rs.LastError = err.Error()
+	l.errLog(fmt.Sprintf("%s failed (%dx, retrying in %s): %v", what, st.consecutiveErrors, wait, err))
+	for _, hint := range GitPullErrorHints(err.Error()) {
+		st.notice("hint:"+hint, func() { l.warn("hint: " + hint) })
+	}
+}
+
 func processRepo(cfg *Config, cfgPath string, st *repoState, rs *RuntimeState, l *logger) {
-	local, err := localCommit(cfg.RepoPath)
+	before, err := localCommit(cfg.RepoPath)
 	if err != nil {
-		st.consecutiveErrors++
-		st.backoffUntil = time.Now().Add(BackoffDuration(st.consecutiveErrors))
-		rs.ConsecutiveErrors = st.consecutiveErrors
-		rs.BackoffUntil = st.backoffUntil
-		rs.LastError = err.Error()
-		l.errLog(fmt.Sprintf("git rev-parse (local) failed (%dx): %v", st.consecutiveErrors, err))
+		st.fail(rs, l, "git rev-parse (local)", err)
 		return
 	}
 
 	remote, err := remoteCommit(cfg.RepoPath, cfg.Branch, cfg.GithubToken)
 	if err != nil {
-		st.consecutiveErrors++
-		st.backoffUntil = time.Now().Add(BackoffDuration(st.consecutiveErrors))
-		rs.ConsecutiveErrors = st.consecutiveErrors
-		rs.BackoffUntil = st.backoffUntil
-		rs.LastError = err.Error()
-		l.errLog(fmt.Sprintf("git fetch failed (%dx): %v", st.consecutiveErrors, err))
+		st.fail(rs, l, "git fetch", err)
 		return
 	}
 
 	// success — reset backoff
+	if st.consecutiveErrors > 0 {
+		l.ok("fetch recovered")
+	}
 	st.consecutiveErrors = 0
 	st.backoffUntil = time.Time{}
 	rs.ConsecutiveErrors = 0
@@ -162,7 +172,32 @@ func processRepo(cfg *Config, cfgPath string, st *repoState, rs *RuntimeState, l
 		l.warn(fmt.Sprintf("could not compute ahead/behind: %v", err))
 	}
 
+	_, own := ownFilesInRepo(cfg, cfgPath)
 	changes, _ := TrackedChanges(cfg.RepoPath)
+	changes = filterOwnChanges(changes, own)
+
+	// Nothing new upstream: done. The exception is hard-reset mode, which
+	// also discards a dirty tree when there is nothing to pull.
+	if before == remote && (len(changes) == 0 || cfg.GitRecoveryMode != "hard-reset") {
+		st.clearNotice("")
+		return
+	}
+
+	target := "origin/" + cfg.Branch
+	hardReset := func(why string) bool {
+		guard := guardOwnFiles(cfg, cfgPath, target)
+		out, resetErr := autoHardReset(cfg.RepoPath, cfg.Branch)
+		for _, note := range guard.restore() {
+			l.info(note)
+		}
+		if resetErr != nil {
+			l.errLog(fmt.Sprintf("auto-recovery hard-reset (%s) failed: %v\n%s", why, resetErr, out))
+			return false
+		}
+		l.warn(fmt.Sprintf("auto-recovery applied: hard-reset to %s (%s)", target, why))
+		return true
+	}
+
 	if len(changes) > 0 {
 		switch cfg.GitRecoveryMode {
 		case "stash":
@@ -171,82 +206,95 @@ func processRepo(cfg *Config, cfgPath string, st *repoState, rs *RuntimeState, l
 				l.errLog(fmt.Sprintf("auto-recovery stash failed: %v\n%s", stashErr, out))
 				return
 			}
-			l.warn("auto-recovery applied: stashed local changes to continue pull")
+			l.warn("auto-recovery applied: stashed local changes to continue pull (see: git stash list)")
 		case "hard-reset":
-			out, resetErr := autoHardReset(cfg.RepoPath, cfg.Branch)
-			if resetErr != nil {
-				l.errLog(fmt.Sprintf("auto-recovery hard-reset (dirty) failed: %v\n%s", resetErr, out))
+			if !hardReset("dirty working tree") {
 				return
 			}
-			l.warn("auto-recovery applied: hard-reset to clear dirty working tree")
-			// hard-reset wipes the assume-unchanged bit and may revert config_auto_pull.json;
-			// restore both so recovery settings survive and runtime files stay quiet.
-			silenceOwnFiles(cfg, cfgPath, l)
 		default:
-			l.warn("working tree has tracked uncommitted changes — skipping pull to avoid conflicts")
-			for _, f := range changes {
-				l.warn("  " + f)
-			}
-			if fixCmds := ArtifactGitignoreHints(changes); len(fixCmds) > 0 {
-				l.warn("hint: these look like build artifacts — run to fix permanently:")
-				for _, cmd := range fixCmds {
-					l.warn("  " + cmd)
+			st.notice("dirty:"+remote+":"+strings.Join(changes, "|"), func() {
+				l.warn("working tree has tracked uncommitted changes — skipping pull to avoid conflicts")
+				for _, f := range changes {
+					l.warn("  " + f)
 				}
-			}
-			for _, hint := range GitRecoveryHints(ahead, behind, true) {
-				l.warn("hint: " + hint)
-			}
+				if fixCmds := ArtifactGitignoreHints(changes); len(fixCmds) > 0 {
+					l.warn("hint: these look like build artifacts — run to fix permanently:")
+					for _, cmd := range fixCmds {
+						l.warn("  " + cmd)
+					}
+				}
+				for _, hint := range GitRecoveryHints(ahead, behind, true) {
+					l.warn("hint: " + hint)
+				}
+				l.warn("(this message is shown once until the situation changes)")
+			})
 			return
 		}
 	}
 
-	if ahead > 0 {
-		switch cfg.GitRecoveryMode {
-		case "hard-reset":
-			out, resetErr := autoHardReset(cfg.RepoPath, cfg.Branch)
-			if resetErr != nil {
-				l.errLog(fmt.Sprintf("auto-recovery hard-reset failed: %v\n%s", resetErr, out))
-				return
-			}
-			l.warn("auto-recovery applied: hard-reset to origin branch")
-			silenceOwnFiles(cfg, cfgPath, l)
-			local, err = localCommit(cfg.RepoPath)
-			if err != nil {
-				l.errLog(fmt.Sprintf("local commit check failed after hard-reset: %v", err))
-				return
-			}
-		default:
-			if behind > 0 {
-				l.warn(fmt.Sprintf("branch diverged (ahead %d, behind %d) — skipping pull", ahead, behind))
-			} else {
-				l.warn(fmt.Sprintf("local branch ahead by %d commit(s) — skipping pull", ahead))
-			}
-			for _, hint := range GitRecoveryHints(ahead, behind, false) {
-				l.warn("hint: " + hint)
-			}
-			return
-		}
-	}
-
-	if local == remote {
-		return // nothing new
-	}
-
-	l.ok(fmt.Sprintf("new commit detected: %s → %s", ShortHash(local), ShortHash(remote)))
-
-	out, err := pull(cfg.RepoPath, cfg.Branch, cfg.GithubToken)
+	head, err := localCommit(cfg.RepoPath)
 	if err != nil {
-		l.errLog(fmt.Sprintf("git pull failed: %v\n%s", err, out))
-		for _, hint := range GitPullErrorHints(err.Error() + "\n" + out) {
-			l.warn("hint: " + hint)
-		}
+		l.errLog(fmt.Sprintf("local commit check failed: %v", err))
 		return
 	}
-	l.ok("git pull completed")
-	if out != "" {
-		l.info("  " + strings.ReplaceAll(out, "\n", "\n  "))
+
+	if head != remote && ahead > 0 {
+		switch cfg.GitRecoveryMode {
+		case "hard-reset":
+			if !hardReset(fmt.Sprintf("local ahead %d, behind %d", ahead, behind)) {
+				return
+			}
+		default:
+			st.notice(fmt.Sprintf("ahead:%s:%s", head, remote), func() {
+				if behind > 0 {
+					l.warn(fmt.Sprintf("branch diverged (ahead %d, behind %d) — skipping pull", ahead, behind))
+				} else {
+					l.warn(fmt.Sprintf("local branch ahead by %d commit(s) — skipping pull", ahead))
+				}
+				for _, hint := range GitRecoveryHints(ahead, behind, false) {
+					l.warn("hint: " + hint)
+				}
+				l.warn("(this message is shown once until the situation changes)")
+			})
+			return
+		}
 	}
 
+	if head, err = localCommit(cfg.RepoPath); err != nil {
+		l.errLog(fmt.Sprintf("local commit check failed: %v", err))
+		return
+	}
+
+	if head != remote {
+		l.ok(fmt.Sprintf("new commit detected: %s → %s", ShortHash(head), ShortHash(remote)))
+		guard := guardOwnFiles(cfg, cfgPath, target)
+		out, mergeErr := mergeFastForward(cfg.RepoPath, cfg.Branch)
+		for _, note := range guard.restore() {
+			l.info(note)
+		}
+		if mergeErr != nil {
+			st.notice("merge:"+remote+":"+out, func() {
+				l.errLog(fmt.Sprintf("git merge --ff-only %s failed: %v\n%s", target, mergeErr, out))
+				for _, hint := range GitPullErrorHints(mergeErr.Error() + "\n" + out) {
+					l.warn("hint: " + hint)
+				}
+				l.warn("(will keep retrying silently until the situation changes)")
+			})
+			return
+		}
+		if out != "" {
+			l.info("  " + strings.ReplaceAll(out, "\n", "\n  "))
+		}
+	}
+
+	after, err := localCommit(cfg.RepoPath)
+	if err != nil || after == before {
+		st.clearNotice("")
+		return
+	}
+
+	st.clearNotice("")
+	l.ok(fmt.Sprintf("updated %s → %s", ShortHash(before), ShortHash(after)))
 	rs.Pulls++
 	rs.LastPull = time.Now()
 
