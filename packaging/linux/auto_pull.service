@@ -8,6 +8,7 @@ Type=simple
 ExecStart=/usr/local/bin/auto_pull /etc/auto_pull/config_auto_pull.json
 Restart=always
 RestartSec=5
+RestartPreventExitStatus=78
 WorkingDirectory=/etc/auto_pull
 StandardOutput=journal
 StandardError=journal

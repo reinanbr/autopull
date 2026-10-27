@@ -9,7 +9,7 @@ import (
 	"github.com/reinanbr/autopull/autopull"
 )
 
-var version = "v1.2.12"
+var version = "v1.2.13"
 
 const usage = `Usage: autopull [command] [config_path]
 
@@ -22,7 +22,7 @@ Commands:
   stop             send SIGTERM to the running daemon
   logs [N]         print last N lines of the log (default: 50)
   dry-run          validate config and connectivity without pulling
-  service ...      systemd integration (install/start/stop/status/logs)
+  service ...      systemd integration (install/start/stop/status/logs/list)
   --version, -v    print version
 
 Token for private repos:

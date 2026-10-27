@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v1.2.13] - 2026-10-27
+
+### Fixed
+- **A systemd service whose repo was moved or deleted crash-looped forever.** A missing config exited with status 1, and `Restart=always` restarted it every 3s indefinitely (seen in production: 270,000+ restarts of a unit pointing at a renamed directory). Unrecoverable setup errors (missing/invalid config, `repo_path` not a git repo) now exit with status 78 (`EX_CONFIG`), and generated units carry `RestartPreventExitStatus=78`, so systemd stops the unit instead. Reinstall existing units (`sudo autopull service install <config>`) to pick up the new directive.
+- **A running watcher kept going after its repo directory was deleted**, failing every tick against a ghost path (and, under systemd, never exiting). If the config file or `repo_path` is missing for 3 consecutive checks, the watcher now logs why and exits with status 78, removing its pid file.
+- **Network failures were reported as authentication failures.** ssh always appends "Could not read from remote repository" to any error, so DNS outages (`Could not resolve hostname`), dropped connections (`closed by remote host`) and timeouts printed "Authentication failed. Check AUTOPULL_TOKEN…". These now get a network hint; `Permission denied (publickey)` is now explicitly classified as an auth failure.
+
+### Added
+- `autopull service list` shows every installed autopull unit, its state and its config path, flagging units whose config no longer exists (with the uninstall command).
+- `autopull status` shows whether a systemd service is installed for the config, and when the watcher isn't running and no service exists, points out that `autopull daemon` does not survive a reboot and suggests `service install`. `autopull daemon` prints the same note.
+
+### Changed
+- Version bumped to v1.2.13.
+
 ## [v1.2.12] - 2026-10-09
 
 ### Fixed

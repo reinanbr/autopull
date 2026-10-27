@@ -331,7 +331,23 @@ func GitPullErrorHints(msg string) []string {
 	raw := strings.ToLower(msg)
 	hints := []string{}
 	switch {
-	case strings.Contains(raw, "authentication failed"),
+	// Network problems must be matched before auth: ssh always appends
+	// "Could not read from remote repository" to any failure, so a DNS outage
+	// would otherwise be reported as bad credentials.
+	case strings.Contains(raw, "could not resolve hostname"),
+		strings.Contains(raw, "could not resolve host"),
+		strings.Contains(raw, "temporary failure in name resolution"),
+		strings.Contains(raw, "closed by remote host"),
+		strings.Contains(raw, "connection reset"),
+		strings.Contains(raw, "connection refused"),
+		strings.Contains(raw, "connection timed out"),
+		strings.Contains(raw, "network is unreachable"),
+		strings.Contains(raw, "timed out after"):
+		hints = append(hints,
+			"Network problem reaching origin (DNS/connection/timeout). Usually transient — autopull retries with backoff; check DNS/connectivity if it persists.",
+		)
+	case strings.Contains(raw, "permission denied (publickey)"),
+		strings.Contains(raw, "authentication failed"),
 		strings.Contains(raw, "repository not found"),
 		strings.Contains(raw, "could not read from remote repository"):
 		hints = append(hints,

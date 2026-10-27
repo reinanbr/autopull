@@ -149,7 +149,7 @@ autopull [command] [config]
 | `stop` | Send SIGTERM to the running daemon |
 | `logs [N]` | Print last N lines of the log (default: 50) |
 | `dry-run` | Validate config and test remote connectivity without pulling |
-| `service <action>` | Manage systemd service (`install`, `start`, `stop`, `restart`, `status`, `logs [N]`, `uninstall`) |
+| `service <action>` | Manage systemd service (`install`, `start`, `stop`, `restart`, `status`, `logs [N]`, `uninstall`, `list`) |
 | `--version` | Print version |
 | `--help` | Print this reference |
 
@@ -204,6 +204,9 @@ autopull service logs 200 /etc/auto_pull/config_auto_pull.json
 sudo autopull service restart /etc/auto_pull/config_auto_pull.json
 sudo autopull service stop /etc/auto_pull/config_auto_pull.json
 sudo autopull service uninstall /etc/auto_pull/config_auto_pull.json
+
+# every installed autopull unit, its state, and whether its config still exists
+autopull service list
 ```
 
 If you omit the config path, it defaults to `./config_auto_pull.json` (same as every
@@ -213,6 +216,9 @@ from also works without repeating the path.
 Notes:
 - `service` subcommands are available only on Linux.
 - `install`/`uninstall`/`start`/`stop`/`restart` usually require elevated permissions.
+- `autopull daemon` does **not** survive a reboot; use `service install` for anything that must keep running.
+- If the config or `repo_path` disappears, the watcher exits with status 78 and the unit's
+  `RestartPreventExitStatus=78` stops systemd from restarting it in a loop.
 - Service user is resolved from `AUTOPULL_SERVICE_USER`, then `SUDO_USER`, then `USER`.
 - Upgrading from a version that used a single global `autopull.service`: run
   `sudo systemctl disable --now autopull && sudo rm /etc/systemd/system/autopull.service`

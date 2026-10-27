@@ -12,6 +12,17 @@ import (
 	"time"
 )
 
+// ExitConfig is the exit status for unrecoverable setup errors (missing or
+// invalid config, repo_path gone). The generated systemd unit lists it in
+// RestartPreventExitStatus, so a service whose repo was moved or deleted
+// stops instead of crash-looping every few seconds forever.
+const ExitConfig = 78 // EX_CONFIG from sysexits.h
+
+// goneTicks is how many consecutive checks the config or repo_path must be
+// missing before the watcher gives up. More than one, so an editor that saves
+// by delete+rename doesn't stop the watcher.
+const goneTicks = 3
+
 // RunWatcher resolves the config path, sets up signal handling, and starts the
 // watch loop. It is the main entry point called by the CLI.
 func RunWatcher(cfgPath string) {
@@ -19,38 +30,51 @@ func RunWatcher(cfgPath string) {
 	if _, err := os.Stat(cfgPath); os.IsNotExist(err) {
 		fmt.Fprintf(os.Stderr, "Config file not found: %s\n", cfgPath)
 		fmt.Fprintln(os.Stderr, "Run 'autopull init' to create one, or see 'autopull --help'")
-		os.Exit(1)
+		os.Exit(ExitConfig)
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
-
-	watch(ctx, cfgPath)
+	code := watch(ctx, cfgPath)
+	stop()
+	if code != 0 {
+		os.Exit(code)
+	}
 }
 
-func watch(ctx context.Context, cfgPath string) {
+// missingPath reports which of the config file and repo_path no longer exist.
+func missingPath(cfgPath, repoPath string) string {
+	if _, err := os.Stat(cfgPath); os.IsNotExist(err) {
+		return "config " + cfgPath
+	}
+	if _, err := os.Stat(repoPath); os.IsNotExist(err) {
+		return "repo_path " + repoPath
+	}
+	return ""
+}
+
+func watch(ctx context.Context, cfgPath string) int {
 	cfg, err := LoadConfig(cfgPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "FATAL: %v\n", err)
-		os.Exit(1)
+		return ExitConfig
 	}
 
 	if err := EnsureGitRepo(cfg.RepoPath); err != nil {
 		fmt.Fprintf(os.Stderr, "FATAL: %v\n", err)
-		os.Exit(1)
+		return ExitConfig
 	}
 
 	pidPath := pidFilePath(cfgPath)
 	lockFile, err := acquireInstanceLock(pidPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "FATAL: %v (pid file: %s)\n", err, pidPath)
-		os.Exit(1)
+		return 1
 	}
 	defer lockFile.Close()
 
 	if err := writePID(pidPath, os.Getpid()); err != nil {
 		fmt.Fprintf(os.Stderr, "FATAL: could not write pid file: %v\n", err)
-		os.Exit(1)
+		return 1
 	}
 	defer os.Remove(pidPath)
 
@@ -61,7 +85,7 @@ func watch(ctx context.Context, cfgPath string) {
 	l, err := newLogger(logPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "FATAL: could not open log file: %v\n", err)
-		os.Exit(1)
+		return 1
 	}
 	defer l.close()
 
@@ -89,15 +113,28 @@ func watch(ctx context.Context, cfgPath string) {
 
 	st := &repoState{}
 	first := true
+	gone := 0
 
 	for {
 		if !first {
 			select {
 			case <-ctx.Done():
 				l.info("shutting down (signal received)")
-				return
+				return 0
 			case <-ticker.C:
 			}
+
+			// A deleted or moved repo would otherwise leave the watcher
+			// failing (and, under systemd, alive) forever on a ghost path.
+			if what := missingPath(cfgPath, cfg.RepoPath); what != "" {
+				gone++
+				if gone >= goneTicks {
+					l.errLog(fmt.Sprintf("%s no longer exists — stopping watcher", what))
+					return ExitConfig
+				}
+				continue
+			}
+			gone = 0
 
 			newCfg, err := LoadConfig(cfgPath)
 			if err != nil {

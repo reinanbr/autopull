@@ -347,6 +347,7 @@ func TestSystemdUnitContent_ContainsFields(t *testing.T) {
 		"[Unit]", "[Service]", "[Install]",
 		"/usr/local/bin/autopull", "/etc/autopull.json",
 		"User=deploy", "Restart=always",
+		"RestartPreventExitStatus=78",
 	}
 	for _, s := range checks {
 		if !strings.Contains(content, s) {

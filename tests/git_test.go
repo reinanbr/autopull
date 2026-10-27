@@ -129,6 +129,32 @@ func TestGitPullErrorHints_AuthFailed(t *testing.T) {
 	}
 }
 
+func TestGitPullErrorHints_DNSFailureIsNotAuth(t *testing.T) {
+	msg := "exit status 128: ssh: Could not resolve hostname github.com: Temporary failure in name resolution\r\nfatal: Could not read from remote repository.\n\nPlease make sure you have the correct access rights"
+	hints := strings.Join(autopull.GitPullErrorHints(msg), "\n")
+	if strings.Contains(hints, "AUTOPULL_TOKEN") {
+		t.Errorf("DNS failure must not be reported as auth failure, got %q", hints)
+	}
+	if !strings.Contains(hints, "Network") {
+		t.Errorf("expected network hint, got %q", hints)
+	}
+}
+
+func TestGitPullErrorHints_ConnectionClosedIsNotAuth(t *testing.T) {
+	msg := "Connection to github.com closed by remote host.\nfatal: Could not read from remote repository."
+	hints := strings.Join(autopull.GitPullErrorHints(msg), "\n")
+	if !strings.Contains(hints, "Network") {
+		t.Errorf("expected network hint, got %q", hints)
+	}
+}
+
+func TestGitPullErrorHints_PublicKeyIsAuth(t *testing.T) {
+	hints := autopull.GitPullErrorHints("git@github.com: Permission denied (publickey).")
+	if !strings.Contains(strings.Join(hints, "\n"), "AUTOPULL_TOKEN") {
+		t.Errorf("expected auth hint, got %v", hints)
+	}
+}
+
 func TestGitPullErrorHints_RepoNotFound(t *testing.T) {
 	hints := autopull.GitPullErrorHints("repository not found")
 	if len(hints) == 0 {

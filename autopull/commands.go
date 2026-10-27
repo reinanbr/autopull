@@ -113,6 +113,12 @@ func CmdStatus(cfgPath string) error {
 		}
 		fmt.Printf("Status  : %s (pid %d)\n", status, pid)
 	}
+	if svc := ServiceName(cfgPath); serviceInstalled(svc) {
+		fmt.Printf("Service : %s (systemd, starts on boot)\n", svc)
+	} else if !running {
+		fmt.Println("hint    : not running. 'autopull daemon' does not survive a reboot; for a")
+		fmt.Printf("hint    : persistent watcher run: sudo autopull service install %s\n", cfgPath)
+	}
 	fmt.Printf("Pulls   : %d\n", state.Pulls)
 	if !state.LastPull.IsZero() {
 		fmt.Printf("Last pull: %s\n", state.LastPull.Format(time.RFC3339))
@@ -332,7 +338,23 @@ func CmdDaemon(cfgPath string) error {
 
 	fmt.Printf("autopull started in background (pid %d)\n", cmd.Process.Pid)
 	fmt.Println("use 'autopull status' and 'autopull logs' to monitor")
+	if runtime.GOOS == "linux" && !serviceInstalled(ServiceName(cfgPath)) {
+		fmt.Println("note: a daemon does not survive a reboot; to start on boot use:")
+		fmt.Printf("  sudo autopull service install %s\n", cfgPath)
+	}
 	return nil
+}
+
+func serviceUnitPath(svcName string) string {
+	return filepath.Join("/etc/systemd/system", svcName+".service")
+}
+
+func serviceInstalled(svcName string) bool {
+	if runtime.GOOS != "linux" {
+		return false
+	}
+	_, err := os.Stat(serviceUnitPath(svcName))
+	return err == nil
 }
 
 func ServiceUser() string {
@@ -359,11 +381,36 @@ Type=simple
 ExecStart=%q %q
 Restart=always
 RestartSec=3
+RestartPreventExitStatus=%d
 User=%s
 
 [Install]
 WantedBy=multi-user.target
-`, execPath, cfgPath, runAsUser)
+`, execPath, cfgPath, ExitConfig, runAsUser)
+}
+
+// unitConfigPath extracts the config path (the last ExecStart argument) from
+// a unit written by SystemdUnitContent.
+func unitConfigPath(unitPath string) string {
+	data, err := os.ReadFile(unitPath)
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		rest, ok := strings.CutPrefix(strings.TrimSpace(line), "ExecStart=")
+		if !ok {
+			continue
+		}
+		fields := strings.Fields(rest)
+		if len(fields) == 0 {
+			return ""
+		}
+		if p, err := strconv.Unquote(fields[len(fields)-1]); err == nil {
+			return p
+		}
+		return fields[len(fields)-1]
+	}
+	return ""
 }
 
 func runCommand(name string, args ...string) (string, error) {
@@ -377,7 +424,7 @@ func CmdService(args []string) error {
 		return fmt.Errorf("service command is only available on Linux")
 	}
 	if len(args) == 0 {
-		return fmt.Errorf("usage: autopull service <install|uninstall|start|stop|restart|status|logs> [config|lines]")
+		return fmt.Errorf("usage: autopull service <install|uninstall|start|stop|restart|status|logs|list> [config|lines]")
 	}
 
 	action := args[0]
@@ -405,7 +452,7 @@ func CmdService(args []string) error {
 		}
 
 		svcName := ServiceName(cfgPath)
-		servicePath := filepath.Join("/etc/systemd/system", svcName+".service")
+		servicePath := serviceUnitPath(svcName)
 		content := SystemdUnitContent(execPath, cfgPath, runAsUser)
 
 		if err := os.WriteFile(servicePath, []byte(content), 0644); err != nil {
@@ -435,7 +482,7 @@ func CmdService(args []string) error {
 			// keep going even if service wasn't active
 			fmt.Fprintf(os.Stderr, "warning: disable failed: %v\n%s\n", err, out)
 		}
-		servicePath := filepath.Join("/etc/systemd/system", svcName+".service")
+		servicePath := serviceUnitPath(svcName)
 		if err := os.Remove(servicePath); err != nil && !os.IsNotExist(err) {
 			return fmt.Errorf("failed removing %s: %w", servicePath, err)
 		}
@@ -463,6 +510,24 @@ func CmdService(args []string) error {
 			return fmt.Errorf("systemctl %s failed: %v", action, err)
 		}
 		fmt.Printf("service %s: %s\n", svcName, action)
+		return nil
+
+	case "list":
+		units, _ := filepath.Glob(serviceUnitPath("autopull-*"))
+		if len(units) == 0 {
+			fmt.Println("no autopull services installed")
+			return nil
+		}
+		for _, unit := range units {
+			svcName := strings.TrimSuffix(filepath.Base(unit), ".service")
+			active, _ := runCommand("systemctl", "is-active", svcName)
+			cfgPath := unitConfigPath(unit)
+			note := ""
+			if _, err := os.Stat(cfgPath); err != nil {
+				note = fmt.Sprintf("  ⚠ config missing — remove with: sudo autopull service uninstall %s", cfgPath)
+			}
+			fmt.Printf("%-45s %-12s %s%s\n", svcName, active, cfgPath, note)
+		}
 		return nil
 
 	case "logs":
