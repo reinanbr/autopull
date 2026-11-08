@@ -100,10 +100,14 @@ func watch(ctx context.Context, cfgPath string) int {
 	if cfg.GithubToken != "" {
 		l.info("  token   : (set)")
 	}
+	tokenUnused := cfg.GithubToken != "" && originIsSSH(cfg.RepoPath)
 	if cfg.PostPullCommand != "" {
 		l.info(fmt.Sprintf("  post-pull: %s", cfg.PostPullCommand))
 	}
 	l.info("═══════════════════════════════════════════")
+	if tokenUnused {
+		l.warn("origin is an SSH remote, so AUTOPULL_TOKEN/GITHUB_TOKEN is not used — fetches authenticate with SSH keys only")
+	}
 
 	prepareOwnFiles(cfg, cfgPath, l)
 

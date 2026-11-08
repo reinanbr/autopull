@@ -149,9 +149,19 @@ func TestGitPullErrorHints_ConnectionClosedIsNotAuth(t *testing.T) {
 }
 
 func TestGitPullErrorHints_PublicKeyIsAuth(t *testing.T) {
-	hints := autopull.GitPullErrorHints("git@github.com: Permission denied (publickey).")
-	if !strings.Contains(strings.Join(hints, "\n"), "AUTOPULL_TOKEN") {
-		t.Errorf("expected auth hint, got %v", hints)
+	hints := strings.Join(autopull.GitPullErrorHints("git@github.com: Permission denied (publickey).\nfatal: Could not read from remote repository."), "\n")
+	if !strings.Contains(hints, "SSH key rejected") {
+		t.Errorf("expected SSH auth hint, got %q", hints)
+	}
+	if !strings.Contains(hints, "ignored for SSH remotes") {
+		t.Errorf("SSH hint must say the token is not used, got %q", hints)
+	}
+}
+
+func TestGitPullErrorHints_HTTPSAuthMentionsToken(t *testing.T) {
+	hints := strings.Join(autopull.GitPullErrorHints("fatal: Authentication failed for 'https://github.com/o/r.git/'"), "\n")
+	if !strings.Contains(hints, "AUTOPULL_TOKEN") {
+		t.Errorf("expected token hint, got %q", hints)
 	}
 }
 

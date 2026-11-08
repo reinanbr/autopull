@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v1.2.14] - 2026-11-08
+
+### Fixed
+- **`Permission denied (publickey)` pointed at the wrong credential.** On an SSH remote the hint said "Check AUTOPULL_TOKEN/GITHUB_TOKEN", but a token is never used for SSH, so people went looking at `.env` instead of the SSH key. SSH rejections now get their own hint: autopull authenticates with the SSH keys of the user it runs as (root under systemd), tokens are ignored for SSH remotes, and a rejection that recovers on the next fetch is a transient server-side denial. HTTPS auth failures keep the token hint.
+- **`autopull init` wrote shell operators as `\u003e`/`\u0026`.** Go's JSON encoder HTML-escapes `<`, `>` and `&`, so a `post_pull_command` such as `./deploy.sh >> log 2>&1` became unreadable in the config file. The config is now written without HTML escaping.
+
+### Added
+- On startup, a warning when `AUTOPULL_TOKEN`/`GITHUB_TOKEN` is set but `origin` is an SSH remote, since the token has no effect there.
+
+### Changed
+- Version bumped to v1.2.14.
+
 ## [v1.2.13] - 2026-10-27
 
 ### Fixed

@@ -117,6 +117,19 @@ func createAskPassScript() (string, func(), error) {
 	return f.Name(), cleanup, nil
 }
 
+// originIsSSH reports whether origin is reached over SSH (scp-style
+// user@host:path or an ssh:// URL), where a token can't be used.
+func originIsSSH(dir string) bool {
+	url, err := runGit(dir, "", "remote", "get-url", "origin")
+	if err != nil {
+		return false
+	}
+	if strings.HasPrefix(url, "ssh://") || strings.HasPrefix(url, "git+ssh://") {
+		return true
+	}
+	return !strings.Contains(url, "://") && strings.Contains(url, "@") && strings.Contains(url, ":")
+}
+
 func localCommit(dir string) (string, error) {
 	return runGit(dir, "", "rev-parse", "HEAD")
 }
@@ -346,8 +359,14 @@ func GitPullErrorHints(msg string) []string {
 		hints = append(hints,
 			"Network problem reaching origin (DNS/connection/timeout). Usually transient — autopull retries with backoff; check DNS/connectivity if it persists.",
 		)
-	case strings.Contains(raw, "permission denied (publickey)"),
-		strings.Contains(raw, "authentication failed"),
+	// An SSH remote never uses AUTOPULL_TOKEN, so pointing at the token here
+	// sends people chasing the wrong credential. GitHub also rejects valid
+	// keys now and then under load; those failures recover on the next tick.
+	case strings.Contains(raw, "permission denied (publickey)"):
+		hints = append(hints,
+			"SSH key rejected by origin. autopull uses the SSH keys of the user it runs as (root under systemd); AUTOPULL_TOKEN/GITHUB_TOKEN are ignored for SSH remotes. If the next fetch recovers on its own, it was a transient rejection on the server side and can be ignored.",
+		)
+	case strings.Contains(raw, "authentication failed"),
 		strings.Contains(raw, "repository not found"),
 		strings.Contains(raw, "could not read from remote repository"):
 		hints = append(hints,

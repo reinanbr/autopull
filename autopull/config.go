@@ -2,6 +2,7 @@ package autopull
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -192,14 +193,19 @@ func NormalizeRecoveryMode(v string) string {
 }
 
 func writeConfig(path string, cfg configFile) error {
-	data, err := json.MarshalIndent(cfg, "", "  ")
-	if err != nil {
+	// json.MarshalIndent escapes <, > and & as \u003c etc., which turns a
+	// post_pull_command like "./deploy.sh >> log 2>&1" into unreadable noise.
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(cfg); err != nil {
 		return err
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
 		return err
 	}
-	return os.WriteFile(path, append(data, '\n'), 0644)
+	return os.WriteFile(path, buf.Bytes(), 0644)
 }
 
 func detectBranch(repoPath string) string {
