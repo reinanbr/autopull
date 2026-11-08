@@ -109,6 +109,19 @@ func watch(ctx context.Context, cfgPath string) int {
 		l.warn("origin is an SSH remote, so AUTOPULL_TOKEN/GITHUB_TOKEN is not used — fetches authenticate with SSH keys only")
 	}
 
+	// Self-heal damage older versions did to the config (escaped shell
+	// operators, a tracked config left dirty) before anything else reads it.
+	if notes, err := repairConfigFile(cfgPath, cfg.RepoPath); err != nil {
+		l.warn(fmt.Sprintf("could not repair config: %v", err))
+	} else if len(notes) > 0 {
+		for _, n := range notes {
+			l.ok(n)
+		}
+		if newCfg, err := LoadConfig(cfgPath); err == nil {
+			cfg = newCfg
+		}
+	}
+
 	prepareOwnFiles(cfg, cfgPath, l)
 
 	interval := time.Duration(cfg.CheckIntervalSeconds) * time.Second

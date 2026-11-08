@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v1.2.15] - 2026-11-08
+
+### Added
+- **Config self-repair on startup.** autopull < v1.2.14 rewrote `config_auto_pull.json` with `&`, `<`, `>` escaped as `\u0026`/`\u003c`/`\u003e` (and sometimes dropped keys it doesn't read, such as `name`), leaving a tracked config permanently modified in `git status` on every server that ran it. Installing a fixed binary didn't undo that damage. The watcher now repairs it when it starts, without ever changing a setting:
+  - tracked config whose local copy is equivalent to the committed one (same settings, no extra keys): the committed copy is restored, so the work tree is clean again;
+  - otherwise (untracked config, or a tracked one with real per-server edits): the escapes are decoded in place, keeping key order, formatting and unknown keys. The rewrite is atomic, keeps the file mode, and only happens if the file decodes to exactly the same JSON.
+  
+  A config with a real local edit is never reverted. Each repair is logged as `[OK] repaired ...`.
+
+### Changed
+- Version bumped to v1.2.15.
+
 ## [v1.2.14] - 2026-11-08
 
 ### Fixed
