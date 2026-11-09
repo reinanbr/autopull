@@ -189,7 +189,21 @@ func CmdStatus(cfgPath string) error {
 		}
 	}
 	fmt.Printf("Recovery: %s (config git_recovery_mode)\n", cfg.GitRecoveryMode)
+	fmt.Println(postPullStatusLine(cfg))
 	return nil
+}
+
+// postPullStatusLine describes what runs after a successful pull, so a
+// missing deploy hook is visible without opening the config.
+func postPullStatusLine(cfg *Config) string {
+	if strings.TrimSpace(cfg.PostPullCommand) == "" {
+		return "Post-pull: none (config post_pull_command; only git is updated)"
+	}
+	workdir := cfg.PostPullWorkdir
+	if workdir == "" {
+		workdir = cfg.RepoPath
+	}
+	return fmt.Sprintf("Post-pull: %s (in %s)", cfg.PostPullCommand, workdir)
 }
 
 func CmdStop(cfgPath string) error {

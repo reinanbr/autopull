@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v1.2.16] - 2026-11-09
+
+### Added
+- **`autopull status` shows the post-pull command.** A new `Post-pull:` line prints the configured `post_pull_command` and the directory it runs in, or `none` when it is empty. Before, a server with no deploy hook looked identical to one with a hook, so "autopull pulled but didn't deploy" required opening the config to diagnose.
+
+### Changed
+- Version bumped to v1.2.16.
+
 ## [v1.2.15] - 2026-11-08
 
 ### Added
